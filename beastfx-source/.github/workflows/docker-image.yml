@@ -1,0 +1,12 @@
+name: BeastFX test
+
+on: [ push, pull_request, workflow_dispatch ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - run: docker build -t beastfx_testing .
+      # - run: docker run beastfx_testing
+ 
