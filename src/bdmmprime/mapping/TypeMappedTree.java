@@ -72,8 +72,10 @@ public class TypeMappedTree extends Tree {
             "BDMM parameterization",
             Input.Validate.REQUIRED);
 
-    public Input<RealParameter> startTypePriorProbsInput = new Input<>("startTypePriorProbs",
-            "The prior probabilities for the initial individual type",
+    public Input<Function> startTypePriorProbsInput = new Input<>("startTypePriorProbs",
+            "The prior probabilities for the initial individual type. May be a "
+            + "RealParameter or any Function (e.g. NBTypeFrequencies), so the "
+            + "mapping can share the same origin frequencies as the likelihood.",
             Input.Validate.REQUIRED);
 
     public Input<Function> finalSampleOffsetInput = new Input<>("finalSampleOffset",
@@ -156,6 +158,14 @@ public class TypeMappedTree extends Tree {
      */
     private void doStochasticMapping() {
 
+        if (param.getNTypes()==1) {
+            // Avoid the full stochastic mapping calculation when unnecessary
+            Node dummyTypedTreeRoot = mapSingleTypeTree(untypedTree.getRoot());
+            numberInternalNodesOnSubtree(dummyTypedTreeRoot, untypedTree.getLeafNodeCount());
+            assignFromWithoutID(new Tree(dummyTypedTreeRoot));
+            return;
+        }
+
         // Record time at start of calculation
         calculationTime = System.currentTimeMillis();
 
@@ -183,7 +193,7 @@ public class TypeMappedTree extends Tree {
         double[] startTypeProbs = new double[param.getNTypes()];
 
         for (int type=0; type<param.getNTypes(); type++)
-            startTypeProbs[type] = y[type+param.getNTypes()]* startTypePriorProbsInput.get().getValue(type);
+            startTypeProbs[type] = y[type+param.getNTypes()]* startTypePriorProbsInput.get().getArrayValue(type);
 
         // (startTypeProbs are unnormalized: this is okay for randomChoicePDF.)
         int startType = Randomizer.randomChoicePDF(startTypeProbs);
@@ -886,6 +896,47 @@ public class TypeMappedTree extends Tree {
         subtreeRoot.setNr(nextNumber);
 
         return nextNumber+1;
+    }
+
+    /**
+     * Produce a dummy "stochastically mapped" tree for single-type models.
+     * This is necessary since users of TypeMappedTree expect a new tree with
+     * appropriately labeled nodes.
+     *
+     * @param subtreeRoot root of single-type tree to "map"
+     * @return root of "mapped" single-type tree
+     */
+    private Node mapSingleTypeTree(Node subtreeRoot) {
+        Node newSubtreeRoot = new Node();
+        setNodeType(newSubtreeRoot, 0);
+        newSubtreeRoot.setHeight(subtreeRoot.getHeight());
+
+        switch(getNodeKind(subtreeRoot)) {
+            case LEAF:
+                newSubtreeRoot.setNr(subtreeRoot.getNr());
+                newSubtreeRoot.setID(subtreeRoot.getID());
+                break;
+
+            case SA:
+                Node oldDAChild = subtreeRoot.getDirectAncestorChild();
+                Node newDAChild = new Node();
+
+                newDAChild.setHeight(oldDAChild.getHeight());
+                setNodeType(newDAChild, 0);
+                newDAChild.setNr(oldDAChild.getNr());
+                newDAChild.setID(oldDAChild.getID());
+
+                newSubtreeRoot.addChild(newDAChild);
+                newSubtreeRoot.addChild(mapSingleTypeTree(subtreeRoot.getNonDirectAncestorChild()));
+                break;
+
+            case INTERNAL:
+                newSubtreeRoot.addChild(mapSingleTypeTree(subtreeRoot.getChild(0)));
+                newSubtreeRoot.addChild(mapSingleTypeTree(subtreeRoot.getChild(1)));
+                break;
+        }
+
+        return newSubtreeRoot;
     }
 
     /*

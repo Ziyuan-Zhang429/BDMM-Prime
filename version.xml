@@ -4,6 +4,7 @@
   <depends on="SA" atleast="2.1.0"/>
 
   <service type="beast.base.core.BEASTInterface">
+    <provider classname="bdmmprime.parameterization.NBTypeFrequencies"/>
     <provider classname="bdmmprime.mapping.AbstractTypeTreeStatsLogger"/>
     <provider classname="bdmmprime.mapping.TypeMappedTree"/>
     <provider classname="bdmmprime.mapping.TypedTreeStatsLogger"/>
@@ -40,6 +41,7 @@
     <provider classname="bdmmprime.parameterization.EpiParameterizationMod"/>
     <provider classname="bdmmprime.parameterization.EpiParameterization"/>
     <provider classname="bdmmprime.parameterization.FBDParameterization"/>
+    <provider classname="bdmmprime.parameterization.NegativeBinomialApproximation"/>
     <provider classname="bdmmprime.parameterization.TypeSet"/>
     <provider classname="bdmmprime.distribution.BirthDeathMigrationDistribution"/>
     <provider classname="bdmmprime.trajectories.simulation.SimulatedTrajectoryLogger"/>

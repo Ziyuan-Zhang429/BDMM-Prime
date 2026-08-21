@@ -1,6 +1,7 @@
 <project default="build" basedir=".">
 
     <property environment="env"/>
+    <property name="env.JAVA_FX_HOME" location="/Library/Java/JavaFX/javafx-sdk-17.0.2"/>
 
     <!-- Source, JUnit test code and jar library locations. -->
     <property name="src" location="src"/>
