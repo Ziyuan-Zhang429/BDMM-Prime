@@ -4,6 +4,7 @@
   <depends on="SA" atleast="2.1.0"/>
 
   <service type="beast.base.core.BEASTInterface">
+    <provider classname="bdmmprime.parameterization.NBTypeFrequencies"/>
     <provider classname="bdmmprime.mapping.AbstractTypeTreeStatsLogger"/>
     <provider classname="bdmmprime.mapping.TypeMappedTree"/>
     <provider classname="bdmmprime.mapping.TypedTreeStatsLogger"/>

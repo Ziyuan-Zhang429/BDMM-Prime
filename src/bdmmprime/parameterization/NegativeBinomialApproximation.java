@@ -10,13 +10,18 @@
 package bdmmprime.parameterization;
 
 import beast.base.core.Input;
+import beast.base.core.Loggable;
 import org.apache.commons.math3.distribution.GammaDistribution;
+import org.apache.commons.math3.linear.Array2DRowRealMatrix;
+import org.apache.commons.math3.linear.EigenDecomposition;
+
+import java.io.PrintStream;
 
 /**
  * Parameterization that approximates negative binomial offspring distribution
  * through discretized Gamma heterogeneity in transmission rates.
  */
-public class NegativeBinomialApproximation extends Parameterization {
+public class NegativeBinomialApproximation extends Parameterization implements Loggable {
 
     // ===== INPUTS =====
 
@@ -47,38 +52,64 @@ public class NegativeBinomialApproximation extends Parameterization {
     public Input<Integer> nTypesInput = new Input<>(
             "nTypes",
             "Number of discrete types for Gamma approximation",
-            20);
+            5);  // default value
 
-    // ===== DEBUG SETTINGS =====
+    public Input<Boolean> gaussLaguerreInput = new Input<>(
+            "gaussLaguerre",
+            "Discretisation scheme for the Gamma transmissibility distribution. "
+            + "false (default): equal-probability bins with equal category weights "
+            + "(1/J) and conditional-mean rates. true: generalized Gauss-Laguerre "
+            + "quadrature with UNEQUAL category weights, which matches the first "
+            + "2J-1 moments of the Gamma exactly (so mean AND variance are captured "
+            + "with far fewer categories).",
+            false);
 
-    private static final double TAIL_PROB = 0.9999999999;
-    private boolean debugPrinted = false;
 
     // ===== CALCULATED VALUES =====
 
     private double[] lambdaValues;
-    private double[] lambdaWeights;
-    private double[] lambdaEdges;
-
+    private double[] categoryWeights;
     private double[] calculatedBirthRates;
     private double[][] calculatedCrossBirthRates;
     private double[] calculatedDeathRates;
     private double[] calculatedSamplingRates;
 
+    // Absolute accuracy for the Gamma inverse-CDF (quantile) solver. The
+    // Commons-Math default (1e-9) is far coarser than the true lower-tail
+    // quantiles at small k (~1e-13), which mislocates the equal-probability
+    // bin edges (producing unequal bin weights). Tightening it makes the
+    // edges — and hence the bin weights — correct.
+    private static final double INV_CDF_ACCURACY = 1e-20;
+
+
     // ===== INITIALIZATION =====
 
-    //    @Override
-//    public void initAndValidate() {
-//        super.initAndValidate();
+    @Override
+    public void initAndValidate() {
+        // Set nTypes from input or use default
+        int requestedTypes = nTypesInput.get();
+        if (requestedTypes < 2) {
+            throw new IllegalArgumentException(
+                    "NegativeBinomialApproximation requires nTypes >= 2");
+        }
 
-//        int requestedTypes = nTypesInput.get();
-//        if (requestedTypes < 2) {
-//            throw new IllegalArgumentException(
-//                    "NegativeBinomialApproximation requires nTypes >= 2");
-//        }
+        // The discretisation categories ARE the model's types. The base
+        // Parameterization derives nTypes from the typeSet and eagerly
+        // allocates its rate arrays inside super.initAndValidate(), so the
+        // typeSet must already carry `requestedTypes` types BEFORE super runs;
+        // otherwise the base is sized for the (scalar) input typeSet and the
+        // rate arrays end up the wrong length (ArrayIndexOutOfBounds, or a
+        // silently wrong likelihood -> nonsensical R at nTypes > 1).
+        typeSetInput.setValue(new TypeSet(requestedTypes), this);
 
-//        nTypes = requestedTypes;
-//    }
+        super.initAndValidate();
+        // nTypes == requestedTypes from here on.
+
+        System.out.println("[NegativeBinomialApproximation] initialised "
+                + "(numerical-guard build) with nTypes=" + nTypes);
+        printDiscretizationDebug(0.0);
+    }
+
 
     // ===== CHANGE TIMES =====
 
@@ -126,6 +157,7 @@ public class NegativeBinomialApproximation extends Parameterization {
         return EMPTY_TIME_ARRAY;
     }
 
+
     // ===== RATE VALUES =====
 
     @Override
@@ -136,19 +168,16 @@ public class NegativeBinomialApproximation extends Parameterization {
 
     @Override
     protected double[][] getCrossBirthRateValues(double time) {
-        recalculateRates(time);
         return calculatedCrossBirthRates;
     }
 
     @Override
     protected double[] getDeathRateValues(double time) {
-        recalculateRates(time);
         return calculatedDeathRates;
     }
 
     @Override
     protected double[] getSamplingRateValues(double time) {
-        recalculateRates(time);
         return calculatedSamplingRates;
     }
 
@@ -174,16 +203,28 @@ public class NegativeBinomialApproximation extends Parameterization {
         return ZERO_VALUE_ARRAY;
     }
 
+
     // ===== CORE CALCULATION =====
+
+    /**
+     * The category weights {w_j} (probability that a new infection falls in
+     * category j), summing to 1. For the equal-probability scheme these are
+     * all 1/J; for Gauss-Laguerre they are the (unequal) quadrature weights.
+     * This is the stationary type distribution of the process, and is the
+     * correct choice for the BDMM origin type prior (startTypePriorProbs).
+     * Evaluated at the start of the process (time 0).
+     */
+    public double[] getCategoryWeights() {
+        recalculateRates(0.0);
+        return categoryWeights.clone();
+    }
 
     private void recalculateRates(double time) {
         int J = getNTypes();
 
         if (lambdaValues == null) {
             lambdaValues = new double[J];
-            lambdaWeights = new double[J];
-            lambdaEdges = new double[J + 1];
-
+            categoryWeights = new double[J];
             calculatedBirthRates = new double[J];
             calculatedCrossBirthRates = new double[J][J];
             calculatedDeathRates = new double[J];
@@ -195,13 +236,46 @@ public class NegativeBinomialApproximation extends Parameterization {
         double psi = samplingPropInput.get().getValuesAtTime(time)[0];
         double nu = removalRateInput.get().getValuesAtTime(time)[0];
 
-        discretizeGamma(meanR, k, lambdaValues, lambdaWeights, lambdaEdges);
+        if (gaussLaguerreInput.get()) {
 
-        for (int j = 0; j < J; j++) {
-            calculatedBirthRates[j] = nu * lambdaValues[j] / (double) J;
+            // ================= VERSION 2: Gauss-Laguerre =================
+            // Generalized Gauss-Laguerre quadrature: UNEQUAL category weights
+            // w_j and nodes chosen so the first 2J-1 moments of the Gamma match
+            // exactly (mean AND variance captured). An offspring draws its
+            // category from {w_k}, so the type-j -> type-k birth rate is
+            // nu*lambda_j*w_k. birthRate[j] carries the same-type channel
+            // (nu*lambda_j*w_j) and crossBirth[j][k] the cross-type channels;
+            // total = nu*lambda_j*sum_k w_k = nu*lambda_j.
+            gaussLaguerreCategories(meanR, k, lambdaValues, categoryWeights);
 
-            for (int kk = 0; kk < J; kk++) {
-                calculatedCrossBirthRates[j][kk] = nu * lambdaValues[j] / (double) J;
+            for (int j = 0; j < J; j++) {
+                double base = nu * lambdaValues[j];
+                calculatedBirthRates[j] = base * categoryWeights[j];
+                for (int kk = 0; kk < J; kk++) {
+                    calculatedCrossBirthRates[j][kk] = base * categoryWeights[kk];
+                }
+            }
+
+        } else {
+
+            // ============ VERSION 1: equal-probability bins ============
+            // J equal-probability bins (weight 1/J each), rate = conditional
+            // mean of each bin. An offspring draws its type uniformly, so the
+            // birth rate to EVERY destination type is nu*lambda_j/J. BDMM's ODE
+            // uses birthRate[j] for the same-type channel (j->j) and
+            // crossBirth[j][k] for cross-type channels (j->k, k!=j; diagonal
+            // ignored). within == cross == nu*lambda_j/J, giving total
+            // birthRate[j] + sum_{k!=j} crossBirth[j][k] = nu*lambda_j.
+            discretizeGamma(meanR, k, lambdaValues);
+
+            double pDest = 1.0 / J;
+            for (int j = 0; j < J; j++) {
+                categoryWeights[j] = pDest;
+                double perDestBirthRate = nu * lambdaValues[j] * pDest;
+                calculatedBirthRates[j] = perDestBirthRate;
+                for (int kk = 0; kk < J; kk++) {
+                    calculatedCrossBirthRates[j][kk] = perDestBirthRate;
+                }
             }
         }
 
@@ -214,133 +288,219 @@ public class NegativeBinomialApproximation extends Parameterization {
         for (int j = 0; j < J; j++) {
             calculatedDeathRates[j] = deathRate;
         }
+    }
 
-        if (!debugPrinted) {
-            printDiscretizationDebug(time, meanR, k, psi, nu);
-            debugPrinted = true;
+    /**
+     * VERSION 2 discretisation: generalized Gauss-Laguerre quadrature for
+     * Gamma(shape=k, scale=R/k). Fills lambdaOut with the J category rates
+     * (lambda_j = (R/k) * node_j) and weightOut with the probability weights
+     * (sum to 1), such that sum_j weightOut[j]*lambdaOut[j]^m equals E[lambda^m]
+     * for every moment m <= 2J-1 (so mean and variance are matched exactly).
+     *
+     * Golub-Welsch: the nodes are the eigenvalues of the symmetric tridiagonal
+     * Jacobi matrix of the generalized Laguerre polynomials (weight
+     * x^alpha e^{-x}, alpha = k-1); the weights are the squared first components
+     * of the corresponding normalized eigenvectors.
+     */
+    private void gaussLaguerreCategories(double R, double k,
+                                         double[] lambdaOut, double[] weightOut) {
+        int J = getNTypes();
+
+        // Degenerate / near-deterministic case: point mass at R.
+        if (Double.isInfinite(k) || k > 1e5) {
+            for (int j = 0; j < J; j++) {
+                lambdaOut[j] = R;
+                weightOut[j] = 1.0 / J;
+            }
+            return;
+        }
+
+        double alpha = k - 1.0;   // weight function x^alpha e^{-x}
+        double theta = R / k;     // Gamma scale
+
+        // Symmetric tridiagonal Jacobi matrix:
+        //   diagonal_i    = 2i + alpha + 1          (i = 0..J-1)
+        //   offdiagonal_i = sqrt(i * (i + alpha))   (i = 1..J-1)
+        double[][] jac = new double[J][J];
+        for (int i = 0; i < J; i++) {
+            jac[i][i] = 2.0 * i + alpha + 1.0;
+            if (i > 0) {
+                double off = Math.sqrt(i * (i + alpha));
+                jac[i][i - 1] = off;
+                jac[i - 1][i] = off;
+            }
+        }
+
+        EigenDecomposition eig =
+                new EigenDecomposition(new Array2DRowRealMatrix(jac, false));
+
+        double wSum = 0.0;
+        for (int j = 0; j < J; j++) {
+            double node = eig.getRealEigenvalue(j);
+            double v0 = eig.getEigenvector(j).getEntry(0);
+            lambdaOut[j] = theta * Math.max(node, 0.0);  // guard tiny negative node
+            weightOut[j] = v0 * v0;                       // Golub-Welsch weight
+            wSum += weightOut[j];
+        }
+        // Renormalise so the weights sum to exactly 1 (guards rounding).
+        for (int j = 0; j < J; j++)
+            weightOut[j] /= wSum;
+
+        // Sort categories by ascending rate (insertion sort over the small J
+        // arrays, carrying the weights along) so the type index tracks
+        // transmissibility: state 0 = lowest lambda, state J-1 = highest,
+        // matching the equal-probability scheme. Category labels are
+        // exchangeable, so this does not change the model.
+        for (int a = 1; a < J; a++) {
+            double lv = lambdaOut[a], wv = weightOut[a];
+            int b = a - 1;
+            while (b >= 0 && lambdaOut[b] > lv) {
+                lambdaOut[b + 1] = lambdaOut[b];
+                weightOut[b + 1] = weightOut[b];
+                b--;
+            }
+            lambdaOut[b + 1] = lv;
+            weightOut[b + 1] = wv;
         }
     }
 
-    private void discretizeGamma(double R, double k,
-                                 double[] lambdaOut,
-                                 double[] weightOut,
-                                 double[] edgeOut) {
+    /**
+     * Diagnostic: prints the Gamma discretisation (edges, per-type weights and
+     * rates, moment summary, cross-birth row sums) at the given time, using the
+     * model's actual computed arrays. Called once from initAndValidate so the
+     * values are easy to check in the run log.
+     */
+    private void printDiscretizationDebug(double time) {
+        int J = getNTypes();
+
+        // populate the model's actual rate arrays for this time
+        recalculateRates(time);
+
+        double R   = meanRInput.get().getValuesAtTime(time)[0];
+        double k   = kInput.get().getValuesAtTime(time)[0];
+        double psi = samplingPropInput.get().getValuesAtTime(time)[0];
+        double nu  = removalRateInput.get().getValuesAtTime(time)[0];
+
+        boolean gl = gaussLaguerreInput.get();
+
+        // Bin edges only exist for the equal-probability scheme.
+        double[] edges = new double[J + 1];
+        if (!gl && !(Double.isInfinite(k) || k > 1e5)) {
+            double shape = k, scale = R / k;
+            GammaDistribution gamma = new GammaDistribution(shape, scale, INV_CDF_ACCURACY);
+            for (int i = 0; i <= J; i++) {
+                double prob = (double) i / J;
+                edges[i] = (prob == 0.0) ? 0.0
+                        : (prob == 1.0) ? Double.POSITIVE_INFINITY
+                        : gamma.inverseCumulativeProbability(prob);
+            }
+        }
+
+        // Use the model's ACTUAL category weights (equal 1/J, or Gauss-Laguerre).
+        double sumW = 0, wMean = 0, wM2 = 0;
+        for (int j = 0; j < J; j++) {
+            sumW  += categoryWeights[j];
+            wMean += categoryWeights[j] * lambdaValues[j];
+            wM2   += categoryWeights[j] * lambdaValues[j] * lambdaValues[j];
+        }
+        double wVar = wM2 - wMean * wMean;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n==== NegativeBinomialApproximation debug ====\n");
+        sb.append("scheme = ").append(gl
+                ? "Gauss-Laguerre quadrature (unequal weights)"
+                : "equal-probability bins (equal weights)").append("\n");
+        sb.append("time = ").append(time).append("\n");
+        sb.append("R = ").append(R).append(", k = ").append(k)
+          .append(", psi = ").append(psi).append(", nu = ").append(nu)
+          .append(", J = ").append(J).append("\n");
+        if (!gl) {
+            sb.append("-- edges --\n");
+            for (int i = 0; i <= J; i++)
+                sb.append("edge[").append(i).append("] = ").append(edges[i]).append("\n");
+        }
+        sb.append("-- category rates and weights --\n");
+        for (int j = 0; j < J; j++)
+            sb.append("type ").append(j).append(": weight = ").append(categoryWeights[j])
+              .append(", lambda = ").append(lambdaValues[j]).append("\n");
+        sb.append("-- summary --\n");
+        sb.append("sum(weights) = ").append(sumW).append("\n");
+        sb.append("weighted mean(lambda) = ").append(wMean).append("\n");
+        sb.append("weighted var(lambda) = ").append(wVar).append("\n");
+        sb.append("target mean(lambda) = ").append(R).append("\n");
+        sb.append("target var(lambda) = ").append(R * R / k).append("\n");
+        sb.append("target offspring var = ").append(R + R * R / k).append("\n");
+        sb.append("-- cross-birth row sums --\n");
+        for (int j = 0; j < J; j++) {
+            double rowSum = 0;
+            for (int kk = 0; kk < J; kk++) rowSum += calculatedCrossBirthRates[j][kk];
+            sb.append("type ").append(j).append(": rowSum = ").append(rowSum)
+              .append(", expected nu*lambda = ").append(nu * lambdaValues[j]).append("\n");
+        }
+        sb.append("============================================");
+        System.out.println(sb);
+    }
+
+    private void discretizeGamma(double R, double k, double[] lambdaOut) {
         int J = getNTypes();
 
         if (Double.isInfinite(k) || k > 1e5) {
             for (int j = 0; j < J; j++) {
                 lambdaOut[j] = R;
-                weightOut[j] = 1.0 / (double) J;
             }
-            for (int i = 0; i < J; i++) {
-                edgeOut[i] = Double.NaN;
-            }
-            edgeOut[J] = Double.POSITIVE_INFINITY;
             return;
         }
 
         double shape = k;
         double scale = R / k;
 
-        GammaDistribution gamma = new GammaDistribution(shape, scale);
-        GammaDistribution gammaPlusOne = new GammaDistribution(shape + 1.0, scale);
+        GammaDistribution gamma = new GammaDistribution(shape, scale, INV_CDF_ACCURACY);
+        GammaDistribution gammaPlusOne = new GammaDistribution(shape + 1, scale, INV_CDF_ACCURACY);
 
+        double[] edges = new double[J + 1];
         for (int i = 0; i <= J; i++) {
-            double prob = (double) i / (double) J;
+            double prob = (double) i / J;
             if (prob == 0.0) {
-                edgeOut[i] = 0.0;
+                edges[i] = 0.0;
             } else if (prob == 1.0) {
-                edgeOut[i] = Double.POSITIVE_INFINITY;
+                edges[i] = Double.POSITIVE_INFINITY;
             } else {
-                edgeOut[i] = gamma.inverseCumulativeProbability(prob);
+                edges[i] = gamma.inverseCumulativeProbability(prob);
             }
         }
 
         for (int j = 0; j < J; j++) {
-            double a = edgeOut[j];
-            double b = edgeOut[j + 1];
+            double a = edges[j];
+            double b = edges[j + 1];
 
-            double bUsed = b;
-            if (Double.isInfinite(bUsed)) {
-                bUsed = gamma.inverseCumulativeProbability(TAIL_PROB);
+            // CDFs at the bin edges. The top bin's upper edge is +infinity,
+            // where both CDFs are exactly 1 (use the exact tail rather than
+            // truncating at an arbitrary quantile, so the top bin also carries
+            // exactly 1/J of the mass and captures the full superspreading tail).
+            double cdfLoK  = gamma.cumulativeProbability(a);
+            double cdfHiK  = Double.isInfinite(b) ? 1.0 : gamma.cumulativeProbability(b);
+            double cdfLoK1 = gammaPlusOne.cumulativeProbability(a);
+            double cdfHiK1 = Double.isInfinite(b) ? 1.0 : gammaPlusOne.cumulativeProbability(b);
+
+            double denom = cdfHiK - cdfLoK;
+
+            // Numerical guard: at small k the Gamma quantile function
+            // underflows in the extreme lower tail, so adjacent edges can
+            // collapse (b <= a) or enclose negligible probability mass
+            // (denom ~ 0). num/denom is then 0/0 = NaN, which poisons the
+            // birth-rate matrix. The limiting conditional mean of such a
+            // degenerate low-probability bin is its (near-zero) lower edge.
+            if (b <= a || denom < 1e-12) {
+                lambdaOut[j] = a;
+                continue;
             }
 
-            double denom = gamma.cumulativeProbability(bUsed)
-                    - gamma.cumulativeProbability(a);
-
-            double num = scale * shape
-                    * (gammaPlusOne.cumulativeProbability(bUsed)
-                    - gammaPlusOne.cumulativeProbability(a));
+            double num = scale * shape * (cdfHiK1 - cdfLoK1);
 
             lambdaOut[j] = num / denom;
-            weightOut[j] = denom;
         }
     }
 
-    private void printDiscretizationDebug(double time, double meanR, double k, double psi, double nu) {
-        int J = getNTypes();
-
-        System.out.println("==== NegativeBinomialApproximation debug ====");
-        System.out.println("time = " + time);
-        System.out.println("R = " + meanR
-                + ", k = " + k
-                + ", psi = " + psi
-                + ", nu = " + nu
-                + ", J = " + J
-                + ", tailProb = " + TAIL_PROB);
-
-        System.out.println("-- edges --");
-        for (int i = 0; i < lambdaEdges.length; i++) {
-            System.out.println("edge[" + i + "] = " + lambdaEdges[i]);
-        }
-
-        System.out.println("-- category rates and weights --");
-        double sumW = 0.0;
-        for (int j = 0; j < J; j++) {
-            System.out.println("type " + j
-                    + ": weight = " + lambdaWeights[j]
-                    + ", lambda = " + lambdaValues[j]);
-            sumW += lambdaWeights[j];
-        }
-
-        double mean = 0.0;
-        for (int j = 0; j < J; j++) {
-            mean += lambdaWeights[j] * lambdaValues[j];
-        }
-        mean /= sumW;
-
-        double var = 0.0;
-        for (int j = 0; j < J; j++) {
-            double diff = lambdaValues[j] - mean;
-            var += lambdaWeights[j] * diff * diff;
-        }
-        var /= sumW;
-
-        System.out.println("-- summary --");
-        System.out.println("sum(weights) = " + sumW);
-        System.out.println("weighted mean(lambda) = " + mean);
-        System.out.println("weighted var(lambda) = " + var);
-        System.out.println("target mean(lambda) = " + meanR);
-
-        if (!Double.isInfinite(k) && k <= 1e5) {
-            System.out.println("target var(lambda) = " + (meanR * meanR / k));
-            System.out.println("target offspring var = " + (meanR + meanR * meanR / k));
-        }
-
-        System.out.println("-- cross-birth row sums --");
-        for (int j = 0; j < J; j++) {
-            double rowSum = 0.0;
-            for (int kk = 0; kk < J; kk++) {
-                rowSum += calculatedCrossBirthRates[j][kk];
-            }
-
-            System.out.println("type " + j
-                    + ": rowSum = " + rowSum
-                    + ", expected nu*lambda = " + (nu * lambdaValues[j]));
-        }
-
-        System.out.println("============================================");
-    }
 
     // ===== VALIDATION =====
 
@@ -358,5 +518,36 @@ public class NegativeBinomialApproximation extends Parameterization {
         if (removalRateInput.get().getNTypes() != 1) {
             throw new IllegalArgumentException("removalRate should be scalar");
         }
+    }
+
+
+    // ===== LOGGING =====
+    // Logs the per-type birth rate (nu * lambda_j) for each of the J
+    // discretisation categories, evaluated at the start of the process.
+
+    @Override
+    public void init(PrintStream out) {
+        String id = getID() == null ? "NBApprox" : getID();
+        int J = getNTypes();
+        for (int j = 0; j < J; j++)
+            out.print(id + ".birthRate" + (j + 1) + "\t");
+        for (int j = 0; j < J; j++)
+            for (int k = 0; k < J; k++)
+                out.print(id + ".crossBirth_" + (j + 1) + "_" + (k + 1) + "\t");
+    }
+
+    @Override
+    public void log(long sample, PrintStream out) {
+        recalculateRates(0.0);
+        int J = getNTypes();
+        for (int j = 0; j < J; j++)
+            out.print(calculatedBirthRates[j] + "\t");
+        for (int j = 0; j < J; j++)
+            for (int k = 0; k < J; k++)
+                out.print(calculatedCrossBirthRates[j][k] + "\t");
+    }
+
+    @Override
+    public void close(PrintStream out) {
     }
 }
