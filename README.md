@@ -1,93 +1,59 @@
-BDMM-Prime
-==========
-[![Unit/integration tests](https://github.com/tgvaughan/BDMM-Prime/actions/workflows/main.yml/badge.svg?branch=master)](https://github.com/tgvaughan/BDMM-Prime/actions/workflows/main.yml)
+# Superspreading
 
-The BDMM-Prime project provides a [BEAST 2](http://www.beast2.org/)
-package for performing phylodynamic inference under both structured
-and unstructured birth-death models.
+Superspreading is a [BEAST 2](http://www.beast2.org/) package that extends
+[BDMM-Prime](https://github.com/tgvaughan/BDMM-Prime) with a negative-binomial
+model of superspreading, in which individual reproductive numbers follow a
+Gamma distribution with mean `meanR` and dispersion `k`.
 
-The BDMM-Prime project is a fork of the original
-[BDMM project](https://github.com/denisekuehnert/bdmm).  The intention is to
-extend the functionality of the original package, while improving its
-flexibility and ease of use.  It incorporates the following enhancements:
-- an improved BEAUti interface that allows a much more diverse range of analyses to be configured,
-- automatic fall-back to analytical solutions for unstructured (single
-  type) analyses (meaning BDMM-Prime includes much of the
-  functionality of [BDSKY](https://github.com/BEAST2-Dev/bdsky)),
-- use of stochastic mapping for sampling ancestral states,
-- a particle filtering algorithm allowing joint sampling of population trajectories,
-- a heavily refactored code base intended to make the package easier to use,
-  extend and maintain.
-  
-Because of the many changes that were required in order to make
-this transition, BDMM-Prime is completely incompatible with BDMM
-itself.  (The original package will be maintained separately to ensure
-that BEAST 2 XMLs and packages that depend on it remain usable.)
+The package does not replace BDMM-Prime; it depends on it and adds:
 
-This repository is primarily of interest to people keen on building
-BDMM-Prime from the source or contributing to its development.  If
-this doesn't include you, please instead visit the project web page
-at:
+- `superspreading.parameterization.NegativeBinomialApproximation`: a BDMM-Prime
+  parameterization that discretises the Gamma-distributed reproductive number
+  into `nTypes` latent categories (equal-probability bins, or Gauss-Laguerre
+  quadrature with `gaussLaguerre="true"`).
+- `superspreading.parameterization.NBTypeFrequencies`: the category weights of
+  a `NegativeBinomialApproximation`, for use as `startTypePriorProbs`.
+- `superspreading.distribution.BirthDeathMigrationDistribution`: a drop-in
+  replacement for BDMM-Prime's tree prior with the same inputs and faster
+  likelihood evaluation:
+  - `useEdgeCaching` (default `true`): only edges whose subtree, edge times or
+    initial conditions changed are re-integrated after a proposal.
+  - `useFastIntegrator` (default `true`): a lean Dormand-Prince 5(4) integrator
+    (same method and tolerances as BDMM-Prime's) and faster ODE derivatives.
+  - `useMeanFieldODE` (default `false`): O(J) instead of O(J^2) ODEs for rank-1
+    parameterizations without migration, such as `NegativeBinomialApproximation`.
+  - `checkEdgeCaching` (default `false`): debugging aid that recomputes every
+    evaluation without the cache and reports any mismatch.
 
-https://tgvaughan.github.io/BDMM-Prime
+All speed-ups are exact up to the ODE tolerance.
 
-There you'll find all of the relevant usage information including
-installation instructions, a complete tutorial, and reference guides
-for using BDMM-Prime via the BEAUti interface. Also included are
-detailed information on its XML interface for advanced users.
+## Usage
 
+Use the classes of this package in place of the BDMM-Prime ones, e.g.
 
-Building from Source
---------------------
+```xml
+<parameterization id="param" spec="superspreading.parameterization.NegativeBinomialApproximation"
+                  nTypes="5" gaussLaguerre="true" typeSet="@typeSet"> ... </parameterization>
 
-To build BDMM-Prime from source you'll need the following to be installed:
-- OpenJDK version 17 or greater
-- A recent version of OpenJFX
-- the Apache Ant build system
+<distribution id="bdmm" spec="superspreading.distribution.BirthDeathMigrationDistribution"
+              tree="@tree" parameterization="@param" typeTraitSet="@typeTraitSet">
+    <startTypePriorProbs spec="superspreading.parameterization.NBTypeFrequencies" parameterization="@param"/>
+</distribution>
+```
 
-Once these are installed and in your execution path, issue the following
-command from the root directory of this repository:
+## Building from source
+
+Requires OpenJDK 17 and Apache Ant. Running
 
 ```sh
-JAVA_FX_HOME=/path/to/openjfx/ ant
+ant
 ```
-The package archive will be left in the `dist/` subdirectory.
 
-Note that unless you already have a local copy of the latest
-[BEAST 2 source](https://github.com/CompEvol/beast2)
-in the directory `../beast2` and the latest
-[BeastFX source](https://github.com/CompEvol/beastfx)
-in the directory `../beastfx` relative to the BDMM-Prime root, the build
-script will attempt to download them automatically.  Thus, most builds
-will require a network connection.
+downloads BDMM-Prime and its dependencies into `deps/` and creates the package
+in `dist/`. `ant install` also installs it into the local BEAST 2.7 package
+directory, and `ant test` runs the unit tests.
 
+## License
 
-Acknowledgements and Citations
-------------------------------
-
-As this is a fork of [BDMM](https://github.com/denisekuehnert/bdmm),
-BDMM-Prime owes its existence to the authors and contributors of
-that project, in particular [Denise Kühnert](https://github.com/denisekuehnert/)
-and [Jérémie Scire](https://github.com/jscire).
-
-If you use this package as part of your research, please cite these papers:
-
-* Vaughan and Stadler, "Bayesian phylodynamic inference of multi-type population trajectories using genomic data",
-  MBE, 42(6):msaf130 (2025), [doi:10.1093/molbev/msaf130](https://doi.org/10.1093/molbev/msaf130)
-* Scire et al., "Robust Phylodynamic Analysis of Genetic Sequencing
-  Data from Structured Populations", Viruses, 14(8):1648 (2022),
-  [doi:10.3390/v14081648](https://doi.org/10.3390/v14081648).
-* Kühnert, et al., "Phylodynamics with Migration: A
-  ComputationalFramework to Quantify Population Structure from Genomic
-  Data", MBE, 33(8):2102-2116 (2016),
-  [doi:10.1093/molbev/msw064](https://doi.org/10.1093/molbev/msw064).
-  
-
-License
--------
-
-BDMM-Prime is free software. It may be modified and distributed under the terms
-of the GNU General Public License version 3 or, at your option, any later
-version. A copy of this license should be found in the file COPYING located in
-the root directory of this repository. If this file is absent for some reason,
-it can also be retrieved from https://www.gnu.org/licenses.
+Superspreading is free software, distributed under the terms of version 3 of
+the GNU General Public License (see `COPYING`).
